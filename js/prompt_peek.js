@@ -1,9 +1,16 @@
 /**
- * PromptPeek v1.4 — live prompt inspection on the node canvas
+ * PromptPeek v1.5 — live prompt inspection on the node canvas
  *
  * Select, cycle (◀ ▶), or drop an image on the node: the prompt it was
  * generated with is parsed client-side from PNG tEXt chunks and drawn
  * directly on the node — no execution needed.
+ *
+ * v1.5 (2026-09-04): hit-tests compared node-local layout rects against
+ * GRAPH coords (e.canvasX/Y) — offset by node.pos, so the copy button
+ * (and scrollbar/page/wheel/hover) only worked with the node near the
+ * canvas origin. All mouse handlers now convert to node-local first.
+ * Also the true root of the v1.1 lockup: the unbounded track test
+ * matched the entire node once pos.x > scrollbarX.
  *
  * v1.4 (2026-09-04): copy button now works on insecure origins (plain-http
  * http://IP:8188 has no navigator.clipboard — legacy textarea+execCommand
@@ -28,7 +35,7 @@
 
 import { app } from "../../../scripts/app.js";
 
-console.log("[PromptPeek] v1.4 loading");
+console.log("[PromptPeek] v1.5 loading");
 
 const NODE_TYPE = "PromptPeek";
 const PAD = 10;
@@ -531,9 +538,14 @@ app.registerExtension({
         const origMouseDown = nodeType.prototype.onMouseDown;
         nodeType.prototype.onMouseDown = function (e, ...rest) {
             const r = regions(this);
+            // Hit-tests run in NODE-LOCAL coords: e.canvasX/Y are graph-world
+            // coords (LiteGraph's adjustMouseEvent), so raw comparisons were
+            // off by node.pos — fixed in v1.5.
+            const lx = e.canvasX - this.pos[0];
+            const ly = e.canvasY - this.pos[1];
             // copy button
             const [cx, cy, cw, ch] = r.copyRect;
-            if (e.canvasX >= cx && e.canvasX <= cx + cw && e.canvasY >= cy && e.canvasY <= cy + ch) {
+            if (lx >= cx && lx <= cx + cw && ly >= cy && ly <= cy + ch) {
                 const text = this._ppMeta?.positive;
                 const nodeRef = this;
                 const done = (ok) => {
@@ -576,8 +588,8 @@ app.registerExtension({
             // edge and swallowed resize-corner grabs; a release off-node then
             // stuck the drag flag and wedged the node.
             if (maxScroll > 0
-                && e.canvasX >= r.scrollbarX - 6 && e.canvasX <= r.scrollbarX + 6
-                && e.canvasY >= bodyTop && e.canvasY <= bodyTop + clipH) {
+                && lx >= r.scrollbarX - 6 && lx <= r.scrollbarX + 6
+                && ly >= bodyTop && ly <= bodyTop + clipH) {
                 this._ppScrollDrag = true;
                 return true;
             }
@@ -586,8 +598,8 @@ app.registerExtension({
             // the scrollbar — any other click falls through to normal node
             // interaction (drag, resize) instead of being swallowed.
             if (maxScroll > 0
-                && e.canvasX >= 0 && e.canvasX <= r.scrollbarX - 6
-                && e.canvasY >= bodyTop && e.canvasY <= r.h - r.previewH) {
+                && lx >= 0 && lx <= r.scrollbarX - 6
+                && ly >= bodyTop && ly <= r.h - r.previewH) {
                 this._ppScroll = Math.min(maxScroll, this._ppScroll + visible);
                 this.setDirtyCanvas(true, true);
                 return true;
@@ -598,8 +610,10 @@ app.registerExtension({
         const origMouseMove = nodeType.prototype.onMouseMove;
         nodeType.prototype.onMouseMove = function (e, ...rest) {
             const r = regions(this);
+            const lx = e.canvasX - this.pos[0];
+            const ly = e.canvasY - this.pos[1];
             const [cx, cy, cw, ch] = r.copyRect;
-            const hover = e.canvasX >= cx && e.canvasX <= cx + cw && e.canvasY >= cy && e.canvasY <= cy + ch;
+            const hover = lx >= cx && lx <= cx + cw && ly >= cy && ly <= cy + ch;
             if (hover !== this._ppCopyHover) {
                 this._ppCopyHover = hover;
                 this.setDirtyCanvas(true, true);
@@ -609,7 +623,7 @@ app.registerExtension({
                 const total = this._ppLines.length;
                 const visible = Math.max(1, Math.floor((clipH - 8) / LINE_H));
                 const maxScroll = Math.max(0, total - visible);
-                const frac = Math.min(1, Math.max(0, (e.canvasY - r.textAreaTop - r.headerH) / Math.max(1, clipH)));
+                const frac = Math.min(1, Math.max(0, (ly - r.textAreaTop - r.headerH) / Math.max(1, clipH)));
                 this._ppScroll = Math.round(frac * maxScroll);
                 this.setDirtyCanvas(true, true);
                 return true;
@@ -630,7 +644,9 @@ app.registerExtension({
         const origOnWheel = nodeType.prototype.onWheel;
         nodeType.prototype.onWheel = function (e, ...rest) {
             const r = regions(this);
-            if (e.canvasX >= 0 && e.canvasX <= r.w && e.canvasY >= r.textAreaTop && e.canvasY <= r.h - r.previewH) {
+            const lx = e.canvasX - this.pos[0];
+            const ly = e.canvasY - this.pos[1];
+            if (lx >= 0 && lx <= r.w && ly >= r.textAreaTop && ly <= r.h - r.previewH) {
                 const dir = e.deltaY > 0 ? 3 : -3;
                 const visible = Math.max(1, Math.floor((r.textAreaH - r.headerH - 8) / LINE_H));
                 const maxScroll = Math.max(0, this._ppLines.length - visible);
