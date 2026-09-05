@@ -1,9 +1,16 @@
 /**
- * PromptPeek v1.5 — live prompt inspection on the node canvas
+ * PromptPeek v1.6 — live prompt inspection on the node canvas
  *
  * Select, cycle (◀ ▶), or drop an image on the node: the prompt it was
  * generated with is parsed client-side from PNG tEXt chunks and drawn
  * directly on the node — no execution needed.
+ *
+ * v1.6 (2026-09-04): stale-prompt fix proper — the Python resolver now
+ * prefers the UI `workflow` chunk's display cache (ShowText and friends)
+ * over the queue-time `prompt` chunk. Pickers roll at EXECUTION, so the
+ * prompt chunk freezes the PREVIOUS run's sentence, while the workflow
+ * chunk records what THIS run displayed. Falls back to prompt-chunk values
+ * when no display cache exists. Server-side change — needs a restart.
  *
  * v1.5 (2026-09-04): hit-tests compared node-local layout rects against
  * GRAPH coords (e.canvasX/Y) — offset by node.pos, so the copy button
@@ -35,7 +42,7 @@
 
 import { app } from "../../../scripts/app.js";
 
-console.log("[PromptPeek] v1.5 loading");
+console.log("[PromptPeek] v1.6 loading");
 
 const NODE_TYPE = "PromptPeek";
 const PAD = 10;

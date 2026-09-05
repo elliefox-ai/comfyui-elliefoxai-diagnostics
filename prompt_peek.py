@@ -23,6 +23,13 @@ import node_helpers
 PREFERRED_TEXT_KEYS = ("text", "string", "prompt", "value")
 # Node classes that glue string pieces together: join their parts directly.
 CONCAT_HINTS = ("concat", "combine", "merge")
+# Node classes whose widget cache mirrors their executed output (display
+# refresh nodes). Only these may override prompt-chunk literals with their
+# workflow-chunk cache: pickers roll at execution time, so the prompt chunk
+# freezes the previous run's sentence while the workflow chunk records what
+# THIS run displayed. Other text nodes' caches hold unrelated widget values
+# (typed placeholders, delimiters) that must not mask linked inputs.
+DISPLAY_HINTS = ("showtext", "show_text", "display", "textviewer")
 MAX_RESOLVE_DEPTH = 12
 
 
@@ -31,7 +38,49 @@ def _is_link(v):
     return isinstance(v, (list, tuple)) and len(v) == 2
 
 
-def _resolve_text(graph, ref, _depth=0, _seen=None):
+def _workflow_display_cache(workflow_raw):
+    """Map UI-graph node ids to their cached widget text (lines joined).
+
+    The `workflow` chunk is the frontend's canvas state saved with the
+    image. Display widgets (ShowText and friends) refresh from execution
+    events, so their cache holds the text THIS run actually displayed —
+    unlike the `prompt` chunk, whose widget values froze at queue time
+    (one roll behind on picker-driven graphs). Subgraph-interior nodes
+    aren't mapped here; lookups degrade gracefully to prompt-chunk values.
+    """
+    try:
+        wf = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(wf, dict):
+        return {}
+
+    def _collect(value, acc):
+        if isinstance(value, str):
+            acc.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item, acc)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _collect(item, acc)
+
+    cache = {}
+    for node in wf.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("id")
+        widgets = node.get("widgets_values")
+        if node_id is None or not isinstance(widgets, list):
+            continue
+        strings = []
+        _collect(widgets, strings)
+        if strings:
+            cache[str(node_id)] = "\n".join(strings)
+    return cache
+
+
+def _resolve_text(graph, ref, _depth=0, _seen=None, wf_cache=None):
     """Resolve a sampler positive/negative link to its prompt text.
 
     Prompts are rarely typed straight into a CLIPTextEncode anymore: they
@@ -39,6 +88,12 @@ def _resolve_text(graph, ref, _depth=0, _seen=None):
     helpers. Follow links recursively and collect every literal text piece
     found along the way, so a prompt assembled from numbered slots resolves
     to its full text.
+
+    wf_cache (from _workflow_display_cache) supplies each node's display
+    cache from the UI `workflow` chunk. Display-class nodes (ShowText and
+    friends) may substitute their cache for their prompt-chunk literals:
+    pickers roll at execution time, so the prompt chunk froze the PREVIOUS
+    run's sentence, while the workflow chunk records what THIS run displayed.
     """
     if _depth > MAX_RESOLVE_DEPTH or not _is_link(ref):
         return None
@@ -60,10 +115,13 @@ def _resolve_text(graph, ref, _depth=0, _seen=None):
         if isinstance(val, str):
             pieces.append(val)
         elif _is_link(val):
-            sub = _resolve_text(graph, val, _depth + 1, _seen)
+            sub = _resolve_text(graph, val, _depth + 1, _seen, wf_cache=wf_cache)
             if sub:
                 pieces.append(sub)
+    cached = wf_cache.get(str(ref[0]), "") if wf_cache else ""
     if pieces:
+        if cached and cached.strip() and any(h in class_type for h in DISPLAY_HINTS):
+            return cached.strip()
         joined = sep.join(pieces).strip()
         return joined or None
     # No text-shaped inputs at all: longest bare string literal as a guess.
@@ -71,7 +129,7 @@ def _resolve_text(graph, ref, _depth=0, _seen=None):
     return max(literals, key=len) if literals else None
 
 
-def summarize_graph(graph):
+def summarize_graph(graph, wf_cache=None):
     """Pull the interesting bits out of a ComfyUI prompt graph."""
     meta = {"positive": "", "negative": "", "model": "", "loras": []}
     anchor = None  # KSampler-style inputs, or CFGGuider for advanced chains
@@ -84,8 +142,8 @@ def summarize_graph(graph):
         ct = str(node.get("class_type", "")).lower()
         if anchor is None and "positive" in inputs and ("sampler" in ct or "guider" in ct):
             anchor = inputs
-            meta["positive"] = _resolve_text(graph, inputs.get("positive")) or meta["positive"]
-            meta["negative"] = _resolve_text(graph, inputs.get("negative")) or meta["negative"]
+            meta["positive"] = _resolve_text(graph, inputs.get("positive"), wf_cache=wf_cache) or meta["positive"]
+            meta["negative"] = _resolve_text(graph, inputs.get("negative"), wf_cache=wf_cache) or meta["negative"]
         if not meta["model"]:
             for k in ("ckpt_name", "unet_name"):
                 if isinstance(inputs.get(k), str):
@@ -134,6 +192,8 @@ def extract_prompt_info(png_path):
     raw = img.info or {}
 
     prompt_json = raw.get("prompt", "")
+    workflow_raw = raw.get("workflow", "")
+    wf_cache = _workflow_display_cache(workflow_raw) if workflow_raw else {}
     params = raw.get("parameters", "")  # A1111-style fallback
 
     text = ""
@@ -141,7 +201,7 @@ def extract_prompt_info(png_path):
         try:
             graph = json.loads(prompt_json)
             if isinstance(graph, dict):
-                text = summarize_graph(graph).get("positive", "")
+                text = summarize_graph(graph, wf_cache=wf_cache).get("positive", "")
         except (json.JSONDecodeError, TypeError):
             pass
     if not text and params:
