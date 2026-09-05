@@ -1,9 +1,15 @@
 /**
- * PromptPeek v1.6 — live prompt inspection on the node canvas
+ * PromptPeek v1.7 — live prompt inspection on the node canvas
  *
  * Select, cycle (◀ ▶), or drop an image on the node: the prompt it was
  * generated with is parsed client-side from PNG tEXt chunks and drawn
  * directly on the node — no execution needed.
+ *
+ * v1.7 (2026-09-04): the panel's browser-side mirror resolved from the
+ * `prompt` chunk only, so the panel still showed the one-behind sentence
+ * even after the server-side v1.6 fix. The mirror now parses the `workflow`
+ * chunk too and prefers display-node caches (ShowText and friends), same
+ * rule as prompt_peek.py. Hard-refresh the browser; no server restart.
  *
  * v1.6 (2026-09-04): stale-prompt fix proper — the Python resolver now
  * prefers the UI `workflow` chunk's display cache (ShowText and friends)
@@ -42,7 +48,7 @@
 
 import { app } from "../../../scripts/app.js";
 
-console.log("[PromptPeek] v1.6 loading");
+console.log("[PromptPeek] v1.7 loading");
 
 const NODE_TYPE = "PromptPeek";
 const PAD = 10;
@@ -98,6 +104,11 @@ function parsePngTextChunks(buffer) {
 const PREFERRED_TEXT_KEYS = ["text", "string", "prompt", "value"];
 // Node classes that glue string pieces together: join their parts directly.
 const CONCAT_HINTS = ["concat", "combine", "merge"];
+// Node classes whose widget cache mirrors their executed output (display
+// refresh nodes). Only these may substitute the workflow chunk's display
+// cache for queue-time prompt-chunk literals — other text nodes' caches
+// hold unrelated widget values that must not mask linked inputs.
+const DISPLAY_HINTS = ["showtext", "show_text", "display", "textviewer"];
 const MAX_RESOLVE_DEPTH = 12;
 
 function isLink(v) {
@@ -108,7 +119,7 @@ function keyIsText(key) {
     return PREFERRED_TEXT_KEYS.some((p) => String(key).startsWith(p));
 }
 
-function resolveText(graph, ref, depth = 0, seen = new Set()) {
+function resolveText(graph, ref, depth = 0, seen = new Set(), wfCache = null) {
     if (depth > MAX_RESOLVE_DEPTH || !isLink(ref)) return null;
     const node = graph[String(ref[0])];
     if (!node || typeof node !== "object" || seen.has(node)) return null;
@@ -122,11 +133,19 @@ function resolveText(graph, ref, depth = 0, seen = new Set()) {
         if (typeof val === "string") {
             pieces.push(val);
         } else if (isLink(val)) {
-            const sub = resolveText(graph, val, depth + 1, seen);
+            const sub = resolveText(graph, val, depth + 1, seen, wfCache);
             if (sub) pieces.push(sub);
         }
     }
     if (pieces.length) {
+        // Display-class nodes refresh their widget from the execution event,
+        // so the workflow chunk's cache holds what THIS run displayed while
+        // the prompt chunk froze the PREVIOUS run's sentence. Only display
+        // classes may short-circuit here (mirrors prompt_peek.py).
+        const cached = wfCache ? wfCache[String(ref[0])] : "";
+        if (cached && cached.trim() && DISPLAY_HINTS.some((h) => ct.includes(h))) {
+            return cached.trim();
+        }
         const joined = pieces.join(sep).trim();
         return joined || null;
     }
@@ -134,7 +153,7 @@ function resolveText(graph, ref, depth = 0, seen = new Set()) {
     return literals.length ? literals.reduce((a, b) => (b.length > a.length ? b : a)) : null;
 }
 
-function summarizeGraph(graph) {
+function summarizeGraph(graph, wfCache = null) {
     const meta = { positive: "", negative: "", model: "", loras: [], seed: "", steps: "", cfg: "", sampler: "" };
     let anchor = null; // KSampler-style inputs, or CFGGuider for advanced chains
     for (const id of Object.keys(graph)) {
@@ -144,8 +163,8 @@ function summarizeGraph(graph) {
         const inputs = node.inputs || {};
         if (!anchor && inputs.positive && (ct.includes("sampler") || ct.includes("guider"))) {
             anchor = inputs;
-            meta.positive = resolveText(graph, inputs.positive) || meta.positive;
-            meta.negative = resolveText(graph, inputs.negative) || meta.negative;
+            meta.positive = resolveText(graph, inputs.positive, 0, new Set(), wfCache) || meta.positive;
+            meta.negative = resolveText(graph, inputs.negative, 0, new Set(), wfCache) || meta.negative;
         }
         if (!meta.model) {
             for (const k of ["ckpt_name", "unet_name"]) {
@@ -185,13 +204,42 @@ function summarizeGraph(graph) {
     return meta;
 }
 
+// Node-id → cached widget text from the UI `workflow` chunk (lines joined).
+// Display widgets refresh from execution events, so their cache holds the
+// text THIS run displayed — the prompt chunk froze at queue time, one roll
+// behind on picker-driven graphs. Mirrors prompt_peek.py's
+// _workflow_display_cache; subgraph-interior nodes aren't mapped and
+// degrade gracefully to prompt-chunk values.
+function workflowDisplayCache(workflowRaw) {
+    if (!workflowRaw) return null;
+    let wf;
+    try { wf = JSON.parse(workflowRaw); } catch (_) { return null; }
+    if (!wf || typeof wf !== "object" || !Array.isArray(wf.nodes)) return null;
+    function collect(value, acc) {
+        if (typeof value === "string") acc.push(value);
+        else if (Array.isArray(value)) { for (const item of value) collect(item, acc); }
+        else if (value && typeof value === "object") { for (const item of Object.values(value)) collect(item, acc); }
+    }
+    const cache = {};
+    for (const node of wf.nodes) {
+        if (!node || typeof node !== "object" || node.id == null) continue;
+        if (!Array.isArray(node.widgets_values)) continue;
+        const strings = [];
+        collect(node.widgets_values, strings);
+        if (strings.length) cache[String(node.id)] = strings.join("\n");
+    }
+    return cache;
+}
+
 function textsToInfo(texts) {
     if (!texts) return null;
     let meta = null;
     if (texts.prompt) {
         try {
             const graph = JSON.parse(texts.prompt);
-            if (graph && typeof graph === "object") meta = summarizeGraph(graph);
+            if (graph && typeof graph === "object") {
+                meta = summarizeGraph(graph, workflowDisplayCache(texts.workflow));
+            }
         } catch (_) { /* fall through */ }
     }
     if (!meta && texts.parameters) {
